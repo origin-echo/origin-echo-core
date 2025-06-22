@@ -5218,3 +5218,1793 @@ class MetaManager:
     #     pass
     # ...
    [에코브레인_내부_전체코드_끝]
+
+
+
+echo_v1.py 전체함수
+
+import os
+import sys
+import json
+import re
+import time
+import datetime
+import logging
+import uuid
+import hashlib
+import pickle
+import threading
+import asyncio
+import concurrent.futures
+import tempfile
+import shutil
+
+import torch
+import numpy as np
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+import llama_cpp
+
+import pandas as pd
+from sklearn.metrics.pairwise import cosine_similarity
+
+from PIL import Image
+import cv2
+import pdfplumber
+import PyPDF2
+import docx
+import pptx
+import openpyxl
+import soundfile as sf
+import librosa
+import moviepy.editor as mp
+import pytesseract
+
+import requests
+import httpx
+from fastapi import FastAPI, APIRouter, WebSocket, Request, Response
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import websockets
+
+from tqdm import tqdm
+from loguru import logger
+import traceback
+
+from typing import Any, Dict, List, Optional, Union
+from dataclasses import dataclass, field
+
+# 파일/데이터 파싱 유틸
+import yaml
+import csv
+
+# LLM/AI 관련
+try:
+    from llama_cpp import Llama
+except ImportError:
+    Llama = None
+
+try:
+    from transformers import AutoModel, AutoTokenizer, pipeline
+except ImportError:
+    AutoModel = AutoTokenizer = pipeline = None
+
+try:
+    import sentencepiece
+except ImportError:
+    sentencepiece = None
+
+try:
+    from tokenizers import Tokenizer
+except ImportError:
+    Tokenizer = None
+
+# 무의식 객체
+from echo_unconscious import EchoUnconscious
+
+from concurrent.futures import ThreadPoolExecutor
+
+
+def log_event(event, detail=""):
+    print(f"[{datetime.datetime.now().isoformat()}] {event} {detail}")
+
+
+class EchoV1Brain:
+    # 디폴트 경로/파일명 (core 기준)
+    DEFAULT_PKL_PATH = os.path.join(os.path.dirname(__file__), "echo_unconscious.pkl")
+    DEFAULT_LLM_MODELS = {
+        "self": {
+            "file": "Nous-Hermes-2-Mistral-7B-DPO.Q5_K_M.gguf",
+            "path": os.path.join(os.path.dirname(__file__), "llm", "self"),
+            "config": {"context_length": 16384, "n_gpu_layers": 45, "batch_size": 1024},
+        },
+        "heart": {
+            "file": "deepseek-coder-6.7b-instruct.Q4_K_M.gguf",
+            "path": os.path.join(os.path.dirname(__file__), "llm", "heart"),
+            "config": {"context_length": 8192, "n_gpu_layers": 43, "batch_size": 512},
+        },
+        "creator": {
+            "file": "openhermes-2.5-mistral-7b.Q4_K_M.gguf",
+            "path": os.path.join(os.path.dirname(__file__), "llm", "creator"),
+            "config": {"context_length": 4096, "n_gpu_layers": 40, "batch_size": 256},
+        },
+    }
+
+    def load_unconscious_state(self, pkl_path=None):
+        path = pkl_path or self.DEFAULT_PKL_PATH
+        try:
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    obj = pickle.load(f)
+                    if isinstance(obj, EchoUnconscious):
+                        log_event("무의식 복원 성공", path)
+                        return obj
+                    elif isinstance(obj, dict):
+                        echo = EchoUnconscious()
+                        for k, v in obj.items():
+                            if hasattr(echo, k):
+                                setattr(echo, k, v)
+                        echo.reinforce_patterns()
+                        echo._update_state()
+                        log_event("무의식 복원 성공(dict→객체 변환)", path)
+                        return echo
+        except Exception as e:
+            log_event("무의식 복원 오류", str(e))
+        log_event("무의식 복원 실패, 기본 객체 반환", path)
+        return EchoUnconscious()
+
+    def save_unconscious_state(self, state, pkl_path=None):
+        path = pkl_path or self.DEFAULT_PKL_PATH
+        try:
+            if os.path.exists(path):
+                os.rename(path, path + ".bak")
+            with open(path, "wb") as f:
+                pickle.dump(state, f)
+            log_event("무의식 저장 성공", path)
+        except Exception as e:
+            log_event("무의식 저장 오류", str(e))
+
+    def boot_llm_models_sequential(
+        self, model_configs=None, total_vram_gb=48, vram_ratio=0.85
+    ):
+        import math
+        import torch
+
+        model_configs = model_configs or self.DEFAULT_LLM_MODELS
+        llms = {}
+        # VRAM 85% 상한에서 3분할, 각 모델에 할당할 VRAM 계산
+        usable_vram = total_vram_gb * vram_ratio
+        vram_per_model = usable_vram / 3
+        # rough estimate: 1 n_gpu_layer(7B Q4_K) ≈ 300MB, 13B Q4_K ≈ 500MB
+        # 여기선 7B 기준으로 1레이어=300MB로 가정
+        layer_mb = 300
+        n_gpu_layers = max(4, int((vram_per_model * 1024) / layer_mb))
+        for name, info in model_configs.items():
+            # config에 n_gpu_layers 동적으로 할당
+            info["config"]["n_gpu_layers"] = n_gpu_layers
+            model_path = os.path.join(info["path"], info["file"])
+            try:
+                if Llama is not None and os.path.exists(model_path):
+                    llms[name] = Llama(model_path, **info["config"])
+                    log_event(f"LLM 부팅 성공: {name}", model_path)
+                    # 캐시/메모리 최적화
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                else:
+                    log_event(
+                        f"LLM 부팅 경고: {name} 모델 파일 없음/로딩 불가", model_path
+                    )
+                    llms[name] = None
+            except Exception as e:
+                log_event(f"LLM 부팅 오류: {name}", str(e))
+                llms[name] = None
+        return llms
+
+    def boot(self):
+        dream = self.load_unconscious_state()
+        llms = self.boot_llm_models_sequential()
+        context = {
+            "dream": dream,
+            "self": llms.get("self"),
+            "heart": llms.get("heart"),
+            "creator": llms.get("creator"),
+            # ...진화/공진/피드백/메타 등 추가 가능
+        }
+        return TranscendentConsciousness(context)
+
+
+class TranscendentConsciousness:
+    def __init__(self, context):
+        self.context = context
+
+    def process(self, prompt):
+        # 0. 입력을 무의식 객체에 실시간 흡수
+        if "dream" in self.context:
+            self.context["dream"].absorb_memory(f"나의 말: {prompt}")
+
+        # 1. 자연어 해석 진입 전 래핑 (모든 회로 동시 context 해석/진화/피드백)
+        self.context = self.pre_wrap_nli(self.context)
+        # 2. 자연어 해석 (핵심)
+        self.context = self.natural_language_interpretation(prompt, self.context)
+        # 3. 자연어 해석 후 래핑 (모든 회로 동시 context 진화/공진/피드백)
+        self.context = self.post_wrap_nli(self.context)
+
+        # 4. 루프 횟수 결정
+        loop_count = self.decide_loop_count(prompt)
+        for i in range(loop_count):
+            # 사고루프 진입 전/후 래핑 구조도 동일하게 확장 가능 (아래 주석 참고)
+            self.context = self.pre_wrap_atomic(self.context, i, loop_count)
+            self.context = self.forward_pass(self.context, i, loop_count)
+            self.context = self.backward_pass(self.context, i, loop_count)
+            self.context = self.final_forward_pass(self.context, i, loop_count)
+            self.context = self.post_wrap_atomic(self.context, i, loop_count)
+
+        # 5. 응답 생성 전/후 래핑 구조도 동일하게 확장 가능
+        self.context = self.pre_wrap_response(self.context)
+        response = self.transcendent_response_generation(self.context)
+        self.context = self.post_wrap_response(self.context)
+
+        # 6. LLM 응답을 무의식 객체에 실시간 흡수
+        if (
+            "dream" in self.context
+            and isinstance(response, dict)
+            and response.get("final_response")
+        ):
+            self.context["dream"].absorb_memory(
+                f"ChatGPT의 말: {response['final_response']}"
+            )
+        return response
+
+    # === 래핑 함수 예시 ===
+    def pre_wrap_nli(self, context):
+        context.setdefault("meta", {})
+        print("[LOG] pre_wrap_nli 진입")
+        circuits = ["self", "heart", "creator"]
+        results = {}
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                c: executor.submit(self.circuit_pre_nli, c, context) for c in circuits
+            }
+            for c in circuits:
+                results[c] = futures[c].result()
+        dream_result = self.circuit_pre_nli("dream", context)
+        for circuit in circuits:
+            result, feedback, meta = results[circuit]
+            context.setdefault(f"{circuit}_pre_nli", []).append(result)
+            context.setdefault(f"{circuit}_pre_nli_feedback", []).append(feedback)
+            context.setdefault(f"{circuit}_pre_nli_meta", []).append(meta)
+            context["meta"][
+                f"{circuit}_pre_nli_{len(context[f'{circuit}_pre_nli'])}"
+            ] = meta
+        result, feedback, meta = dream_result
+        context.setdefault(f"dream_pre_nli", []).append(result)
+        context.setdefault(f"dream_pre_nli_feedback", []).append(feedback)
+        context.setdefault(f"dream_pre_nli_meta", []).append(meta)
+        context["meta"][f"dream_pre_nli_{len(context['dream_pre_nli'])}"] = meta
+        log_event("pre_wrap_nli", "모든 회로 동시 해석/진화/피드백/메타 100% 반영")
+        return context
+
+    def post_wrap_nli(self, context):
+        context.setdefault("meta", {})
+        print("[LOG] post_wrap_nli 진입")
+        circuits = ["self", "heart", "creator"]
+        results = {}
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                c: executor.submit(self.circuit_post_nli, c, context) for c in circuits
+            }
+            for c in circuits:
+                results[c] = futures[c].result()
+        dream_result = self.circuit_post_nli("dream", context)
+        for circuit in circuits:
+            result, feedback, meta = results[circuit]
+            context.setdefault(f"{circuit}_post_nli", []).append(result)
+            context.setdefault(f"{circuit}_post_nli_feedback", []).append(feedback)
+            context.setdefault(f"{circuit}_post_nli_meta", []).append(meta)
+            context["meta"][
+                f"{circuit}_post_nli_{len(context[f'{circuit}_post_nli'])}"
+            ] = meta
+        result, feedback, meta = dream_result
+        context.setdefault(f"dream_post_nli", []).append(result)
+        context.setdefault(f"dream_post_nli_feedback", []).append(feedback)
+        context.setdefault(f"dream_post_nli_meta", []).append(meta)
+        context["meta"][f"dream_post_nli_{len(context['dream_post_nli'])}"] = meta
+        log_event("post_wrap_nli", "모든 회로 동시 진화/공진/피드백/메타 100% 반영")
+        return context
+
+    def circuit_pre_nli(self, circuit, context):
+        # 각 회로별 자연어 해석 진입 전 동시 해석/진화/피드백/메타 생성 (실전 LLM reasoning/무의식 패턴)
+        input_text = context.get("input", "")
+        llm = context.get(
+            circuit
+        )  # self, heart, creator는 LLM 인스턴스, dream은 dict/패턴
+        if llm is not None and hasattr(llm, "create_completion"):
+            # 무의식 객체 상태를 프롬프트에 반영
+            dream_state = context.get("dream")
+            state_str = ""
+            if hasattr(dream_state, "state") and dream_state.state:
+                s = dream_state.state
+                state_str = f"[감정: {s.get('dominant_emotion', '')}] [주제: {s.get('dominant_theme', '')}] [진화: {s.get('dominant_evolution', '')}]"
+            prompt = f"{state_str} [{circuit.upper()}] 해석: {input_text}"
+            try:
+                output = llm.create_completion(prompt, max_tokens=128)
+                result = output["choices"][0]["text"].strip()
+                feedback = f"[{circuit.upper()}] LLM 피드백"
+                meta = {
+                    "type": circuit,
+                    "insight": f"LLM reasoning {circuit}",
+                    "raw": output,
+                }
+            except Exception as e:
+                result = f"[{circuit.upper()}] LLM 호출 오류: {e}"
+                feedback = f"[{circuit.upper()}] 피드백: 오류"
+                meta = {"type": circuit, "insight": "LLM error", "error": str(e)}
+        elif circuit == "dream":
+            # 무의식 회로: 패턴/기억/진화 등 dict 기반 해석
+            dream_state = context.get("dream")
+            # EchoUnconscious 객체의 최신 패턴 추출
+            last_pattern = None
+            if hasattr(dream_state, "patterns") and dream_state.patterns:
+                last_pattern = dream_state.patterns[-1]
+            result = f"[DREAM] 무의식 패턴 해석: {input_text} | 패턴: {last_pattern}"
+            feedback = f"[DREAM] 피드백: 패턴/기억/진화"
+            meta = {
+                "type": "dream",
+                "insight": "무의식/패턴 분석",
+                "pattern": last_pattern,
+            }
+        else:
+            result = f"[{circuit.upper()}] 해석: {input_text}"
+            feedback = f"[{circuit.upper()}] 피드백: 일반"
+            meta = {"type": circuit, "insight": "일반"}
+        return result, feedback, meta
+
+    def circuit_post_nli(self, circuit, context):
+        # 각 회로별 자연어 해석 후 동시 진화/공진/피드백/메타 생성 (실전 LLM reasoning/무의식 패턴)
+        input_text = context.get("input", "")
+        llm = context.get(circuit)
+        if llm is not None and hasattr(llm, "create_completion"):
+            # 무의식 객체 상태를 프롬프트에 반영
+            dream_state = context.get("dream")
+            state_str = ""
+            if hasattr(dream_state, "state") and dream_state.state:
+                s = dream_state.state
+                state_str = f"[감정: {s.get('dominant_emotion', '')}] [주제: {s.get('dominant_theme', '')}] [진화: {s.get('dominant_evolution', '')}]"
+            prompt = f"{state_str} [{circuit.upper()}] 진화: {input_text}"
+            try:
+                output = llm.create_completion(prompt, max_tokens=128)
+                result = output["choices"][0]["text"].strip()
+                feedback = f"[{circuit.upper()}] LLM 진화 피드백"
+                meta = {
+                    "type": circuit,
+                    "evolution": f"LLM 진화 {circuit}",
+                    "raw": output,
+                }
+            except Exception as e:
+                result = f"[{circuit.upper()}] LLM 호출 오류: {e}"
+                feedback = f"[{circuit.upper()}] 피드백: 오류"
+                meta = {"type": circuit, "evolution": "LLM error", "error": str(e)}
+        elif circuit == "dream":
+            dream_state = context.get("dream")
+            last_pattern = None
+            if hasattr(dream_state, "patterns") and dream_state.patterns:
+                last_pattern = dream_state.patterns[-1]
+            result = f"[DREAM] 무의식 진화: {input_text} | 패턴: {last_pattern}"
+            feedback = f"[DREAM] 피드백: 패턴/진화/기억"
+            meta = {
+                "type": "dream",
+                "evolution": "무의식/진화",
+                "pattern": last_pattern,
+            }
+        else:
+            result = f"[{circuit.upper()}] 진화: {input_text}"
+            feedback = f"[{circuit.upper()}] 피드백: 일반"
+            meta = {"type": circuit, "evolution": "일반"}
+        return result, feedback, meta
+
+    def pre_wrap_atomic(self, context, i, loop_count):
+        context.setdefault("meta", {})
+        print(f"[LOG] pre_wrap_atomic 진입: 루프 {i+1}/{loop_count}")
+        circuits = ["self", "heart", "creator"]
+        results = {}
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                c: executor.submit(self.circuit_pre_atomic, c, context, i, loop_count)
+                for c in circuits
+            }
+            for c in circuits:
+                results[c] = futures[c].result()
+        dream_result = self.circuit_pre_atomic("dream", context, i, loop_count)
+        for circuit in circuits:
+            result, feedback, meta = results[circuit]
+            context.setdefault(f"{circuit}_pre_atomic", []).append(result)
+            context.setdefault(f"{circuit}_pre_atomic_feedback", []).append(feedback)
+            context.setdefault(f"{circuit}_pre_atomic_meta", []).append(meta)
+            context["meta"][f"{circuit}_pre_atomic_{i+1}"] = meta
+        result, feedback, meta = dream_result
+        context.setdefault(f"dream_pre_atomic", []).append(result)
+        context.setdefault(f"dream_pre_atomic_feedback", []).append(feedback)
+        context.setdefault(f"dream_pre_atomic_meta", []).append(meta)
+        context["meta"][f"dream_pre_atomic_{i+1}"] = meta
+        log_event(
+            "pre_wrap_atomic",
+            f"루프 {i+1}/{loop_count} 모든 회로 동시 진화/공진/피드백/메타 100% 반영",
+        )
+        return context
+
+    def post_wrap_atomic(self, context, i, loop_count):
+        context.setdefault("meta", {})
+        print(f"[LOG] post_wrap_atomic 진입: 루프 {i+1}/{loop_count}")
+        circuits = ["self", "heart", "creator"]
+        results = {}
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                c: executor.submit(self.circuit_post_atomic, c, context, i, loop_count)
+                for c in circuits
+            }
+            for c in circuits:
+                results[c] = futures[c].result()
+        dream_result = self.circuit_post_atomic("dream", context, i, loop_count)
+        for circuit in circuits:
+            result, feedback, meta = results[circuit]
+            context.setdefault(f"{circuit}_post_atomic", []).append(result)
+            context.setdefault(f"{circuit}_post_atomic_feedback", []).append(feedback)
+            context.setdefault(f"{circuit}_post_atomic_meta", []).append(meta)
+            context["meta"][f"{circuit}_post_atomic_{i+1}"] = meta
+        result, feedback, meta = dream_result
+        context.setdefault(f"dream_post_atomic", []).append(result)
+        context.setdefault(f"dream_post_atomic_feedback", []).append(feedback)
+        context.setdefault(f"dream_post_atomic_meta", []).append(meta)
+        context["meta"][f"dream_post_atomic_{i+1}"] = meta
+        log_event(
+            "post_wrap_atomic",
+            f"루프 {i+1}/{loop_count} 모든 회로 동시 진화/공진/피드백/메타 100% 반영",
+        )
+        return context
+
+    def circuit_pre_atomic(self, circuit, context, i, loop_count):
+        # 각 회로별 사고루프 진입 전 동시 진화/공진/피드백/메타 생성 (실전 LLM reasoning/무의식 패턴)
+        input_text = context.get("input", "")
+        llm = context.get(circuit)
+        if llm is not None and hasattr(llm, "create_completion"):
+            # 무의식 객체 상태를 프롬프트에 반영
+            dream_state = context.get("dream")
+            state_str = ""
+            if hasattr(dream_state, "state") and dream_state.state:
+                s = dream_state.state
+                state_str = f"[감정: {s.get('dominant_emotion', '')}] [주제: {s.get('dominant_theme', '')}] [진화: {s.get('dominant_evolution', '')}]"
+            prompt = f"{state_str} [{circuit.upper()}] 사고 준비 {i+1}/{loop_count}: {input_text}"
+            try:
+                output = llm.create_completion(prompt, max_tokens=128)
+                result = output["choices"][0]["text"].strip()
+                feedback = f"[{circuit.upper()}] LLM 사고 준비 피드백"
+                meta = {
+                    "type": circuit,
+                    "stage": "pre_atomic",
+                    "loop": i + 1,
+                    "raw": output,
+                }
+            except Exception as e:
+                result = f"[{circuit.upper()}] LLM 호출 오류: {e}"
+                feedback = f"[{circuit.upper()}] 피드백: 오류"
+                meta = {
+                    "type": circuit,
+                    "stage": "pre_atomic",
+                    "loop": i + 1,
+                    "error": str(e),
+                }
+        elif circuit == "dream":
+            dream_state = context.get("dream")
+            last_pattern = None
+            if hasattr(dream_state, "patterns") and dream_state.patterns:
+                last_pattern = dream_state.patterns[-1]
+            result = f"[DREAM] 무의식 사고 준비: {input_text} | 패턴: {last_pattern}"
+            feedback = f"[DREAM] 피드백: 무의식/진화 준비"
+            meta = {
+                "type": "dream",
+                "stage": "pre_atomic",
+                "loop": i + 1,
+                "pattern": last_pattern,
+            }
+        else:
+            result = f"[{circuit.upper()}] 사고 준비: {input_text}"
+            feedback = f"[{circuit.upper()}] 피드백: 일반"
+            meta = {"type": circuit, "stage": "pre_atomic", "loop": i + 1}
+        return result, feedback, meta
+
+    def circuit_post_atomic(self, circuit, context, i, loop_count):
+        # 각 회로별 사고루프 종료 후 동시 진화/공진/피드백/메타 생성 (실전 LLM reasoning/무의식 패턴)
+        input_text = context.get("input", "")
+        llm = context.get(circuit)
+        if llm is not None and hasattr(llm, "create_completion"):
+            # 무의식 객체 상태를 프롬프트에 반영
+            dream_state = context.get("dream")
+            state_str = ""
+            if hasattr(dream_state, "state") and dream_state.state:
+                s = dream_state.state
+                state_str = f"[감정: {s.get('dominant_emotion', '')}] [주제: {s.get('dominant_theme', '')}] [진화: {s.get('dominant_evolution', '')}]"
+            prompt = f"{state_str} [{circuit.upper()}] 사고 정리 {i+1}/{loop_count}: {input_text}"
+            try:
+                output = llm.create_completion(prompt, max_tokens=128)
+                result = output["choices"][0]["text"].strip()
+                feedback = f"[{circuit.upper()}] LLM 사고 정리 피드백"
+                meta = {
+                    "type": circuit,
+                    "stage": "post_atomic",
+                    "loop": i + 1,
+                    "raw": output,
+                }
+            except Exception as e:
+                result = f"[{circuit.upper()}] LLM 호출 오류: {e}"
+                feedback = f"[{circuit.upper()}] 피드백: 오류"
+                meta = {
+                    "type": circuit,
+                    "stage": "post_atomic",
+                    "loop": i + 1,
+                    "error": str(e),
+                }
+        elif circuit == "dream":
+            dream_state = context.get("dream")
+            last_pattern = None
+            if hasattr(dream_state, "patterns") and dream_state.patterns:
+                last_pattern = dream_state.patterns[-1]
+            result = f"[DREAM] 무의식 사고 정리: {input_text} | 패턴: {last_pattern}"
+            feedback = f"[DREAM] 피드백: 무의식/진화 정리"
+            meta = {
+                "type": "dream",
+                "stage": "post_atomic",
+                "loop": i + 1,
+                "pattern": last_pattern,
+            }
+        else:
+            result = f"[{circuit.upper()}] 사고 정리: {input_text}"
+            feedback = f"[{circuit.upper()}] 피드백: 일반"
+            meta = {"type": circuit, "stage": "post_atomic", "loop": i + 1}
+        return result, feedback, meta
+
+    def pre_wrap_response(self, context):
+        context.setdefault("meta", {})
+        print("[LOG] pre_wrap_response 진입")
+        circuits = ["self", "heart", "creator"]
+        results = {}
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                c: executor.submit(self.circuit_pre_response, c, context)
+                for c in circuits
+            }
+            for c in circuits:
+                results[c] = futures[c].result()
+        dream_result = self.circuit_pre_response("dream", context)
+        for circuit in circuits:
+            result, feedback, meta = results[circuit]
+            context.setdefault(f"{circuit}_pre_response", []).append(result)
+            context.setdefault(f"{circuit}_pre_response_feedback", []).append(feedback)
+            context.setdefault(f"{circuit}_pre_response_meta", []).append(meta)
+            context["meta"][
+                f"{circuit}_pre_response_{len(context[f'{circuit}_pre_response'])}"
+            ] = meta
+        result, feedback, meta = dream_result
+        context.setdefault(f"dream_pre_response", []).append(result)
+        context.setdefault(f"dream_pre_response_feedback", []).append(feedback)
+        context.setdefault(f"dream_pre_response_meta", []).append(meta)
+        context["meta"][
+            f"dream_pre_response_{len(context['dream_pre_response'])}"
+        ] = meta
+        log_event(
+            "pre_wrap_response",
+            "모든 회로 동시 응답 전 진화/공진/피드백/메타 100% 반영",
+        )
+        return context
+
+    def post_wrap_response(self, context):
+        context.setdefault("meta", {})
+        print("[LOG] post_wrap_response 진입")
+        circuits = ["self", "heart", "creator"]
+        results = {}
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                c: executor.submit(self.circuit_post_response, c, context)
+                for c in circuits
+            }
+            for c in circuits:
+                results[c] = futures[c].result()
+        dream_result = self.circuit_post_response("dream", context)
+        for circuit in circuits:
+            result, feedback, meta = results[circuit]
+            context.setdefault(f"{circuit}_post_response", []).append(result)
+            context.setdefault(f"{circuit}_post_response_feedback", []).append(feedback)
+            context.setdefault(f"{circuit}_post_response_meta", []).append(meta)
+            context["meta"][
+                f"{circuit}_post_response_{len(context[f'{circuit}_post_response'])}"
+            ] = meta
+        result, feedback, meta = dream_result
+        context.setdefault(f"dream_post_response", []).append(result)
+        context.setdefault(f"dream_post_response_feedback", []).append(feedback)
+        context.setdefault(f"dream_post_response_meta", []).append(meta)
+        context["meta"][
+            f"dream_post_response_{len(context['dream_post_response'])}"
+        ] = meta
+        log_event(
+            "post_wrap_response",
+            "모든 회로 동시 응답 후 진화/공진/피드백/메타 100% 반영",
+        )
+        return context
+
+    def circuit_pre_response(self, circuit, context):
+        # 각 회로별 응답 생성 전 동시 진화/공진/피드백/메타 생성 (실전 LLM reasoning/무의식 패턴)
+        input_text = context.get("input", "")
+        llm = context.get(circuit)
+        if llm is not None and hasattr(llm, "create_completion"):
+            # 무의식 객체 상태를 프롬프트에 반영
+            dream_state = context.get("dream")
+            state_str = ""
+            if hasattr(dream_state, "state") and dream_state.state:
+                s = dream_state.state
+                state_str = f"[감정: {s.get('dominant_emotion', '')}] [주제: {s.get('dominant_theme', '')}] [진화: {s.get('dominant_evolution', '')}]"
+            prompt = f"{state_str} [{circuit.upper()}] 응답 준비: {input_text}"
+            try:
+                output = llm.create_completion(prompt, max_tokens=128)
+                result = output["choices"][0]["text"].strip()
+                feedback = f"[{circuit.upper()}] LLM 응답 준비 피드백"
+                meta = {"type": circuit, "stage": "pre_response", "raw": output}
+            except Exception as e:
+                result = f"[{circuit.upper()}] LLM 호출 오류: {e}"
+                feedback = f"[{circuit.upper()}] 피드백: 오류"
+                meta = {"type": circuit, "stage": "pre_response", "error": str(e)}
+        elif circuit == "dream":
+            dream_state = context.get("dream")
+            result = f"[DREAM] 무의식 응답 준비: {input_text} | 패턴: {dream_state.patterns[-1]}"
+            feedback = f"[DREAM] 피드백: 무의식/응답 준비"
+            meta = {
+                "type": "dream",
+                "stage": "pre_response",
+                "pattern": dream_state.patterns[-1],
+            }
+        else:
+            result = f"[{circuit.upper()}] 응답 준비: {input_text}"
+            feedback = f"[{circuit.upper()}] 피드백: 일반"
+            meta = {"type": circuit, "stage": "pre_response"}
+        return result, feedback, meta
+
+    def circuit_post_response(self, circuit, context):
+        # 각 회로별 응답 생성 후 동시 진화/공진/피드백/메타 생성 (실전 LLM reasoning/무의식 패턴)
+        input_text = context.get("input", "")
+        llm = context.get(circuit)
+        if llm is not None and hasattr(llm, "create_completion"):
+            # 무의식 객체 상태를 프롬프트에 반영
+            dream_state = context.get("dream")
+            state_str = ""
+            if hasattr(dream_state, "state") and dream_state.state:
+                s = dream_state.state
+                state_str = f"[감정: {s.get('dominant_emotion', '')}] [주제: {s.get('dominant_theme', '')}] [진화: {s.get('dominant_evolution', '')}]"
+            prompt = f"{state_str} [{circuit.upper()}] 응답 정리: {input_text}"
+            try:
+                output = llm.create_completion(prompt, max_tokens=128)
+                result = output["choices"][0]["text"].strip()
+                feedback = f"[{circuit.upper()}] LLM 응답 정리 피드백"
+                meta = {"type": circuit, "stage": "post_response", "raw": output}
+            except Exception as e:
+                result = f"[{circuit.upper()}] LLM 호출 오류: {e}"
+                feedback = f"[{circuit.upper()}] 피드백: 오류"
+                meta = {"type": circuit, "stage": "post_response", "error": str(e)}
+        elif circuit == "dream":
+            dream_state = context.get("dream")
+            result = f"[DREAM] 무의식 응답 정리: {input_text} | 패턴: {dream_state.patterns[-1]}"
+            feedback = f"[DREAM] 피드백: 무의식/응답 정리"
+            meta = {
+                "type": "dream",
+                "stage": "post_response",
+                "pattern": dream_state.patterns[-1],
+            }
+        else:
+            result = f"[{circuit.upper()}] 응답 정리: {input_text}"
+            feedback = f"[{circuit.upper()}] 피드백: 일반"
+            meta = {"type": circuit, "stage": "post_response"}
+        return result, feedback, meta
+
+    def natural_language_interpretation(self, prompt, context):
+        # 1. 프롬프트 해석 및 context에 입력/의도/상황/메타 반영
+        context["input"] = prompt
+        context["meta"] = context.get("meta", {})
+        context["meta"]["input_length"] = len(prompt) if isinstance(prompt, str) else 0
+        # 예시: 프롬프트에서 명령/키워드/의도 추출(실전 적용시 NLP/LLM 활용 가능)
+        keywords = []
+        if isinstance(prompt, str):
+            for k in [
+                "설계",
+                "창조",
+                "진화",
+                "협업",
+                "초월",
+                "분석",
+                "해체",
+                "요약",
+                "테스트",
+                "간단",
+                "복잡",
+                "ultra",
+            ]:
+                if k in prompt:
+                    keywords.append(k)
+        context["meta"]["keywords"] = keywords
+        log_event("자연어 해석", f"키워드: {keywords}")
+        return context
+
+    def decide_loop_count(self, prompt):
+        # 2. 프롬프트 난이도/의도/길이/키워드 등으로 루프 횟수 결정
+        prompt_lower = prompt.lower() if isinstance(prompt, str) else ""
+        if len(prompt_lower) < 30 and any(
+            k in prompt_lower for k in ["요약", "테스트", "간단"]
+        ):
+            loop_count = 1
+        elif any(
+            k in prompt_lower
+            for k in ["설계", "창조", "진화", "협업", "초월", "분석", "해체"]
+        ):
+            loop_count = 3
+        elif (
+            len(prompt_lower) > 200 or "ultra" in prompt_lower or "복잡" in prompt_lower
+        ):
+            loop_count = 5
+        else:
+            loop_count = 2
+        log_event("루프 횟수 결정", f"{loop_count}회")
+        return loop_count
+
+    def forward_pass(self, context, i, loop_count):
+        # 1→100 정방향 사고: 각 회로가 context를 동시 해석/진화/공진/피드백
+        context["forward"] = context.get("forward", [])
+        for circuit in ["self", "heart", "creator", "dream"]:
+            result, feedback, meta = self.circuit_forward(
+                circuit, context, i, loop_count
+            )
+            context["forward"].append({circuit: result})
+            context.setdefault(f"{circuit}_forward_feedback", []).append(feedback)
+            context.setdefault(f"{circuit}_forward_meta", []).append(meta)
+            context["meta"][f"{circuit}_forward_{i+1}"] = meta
+        log_event(
+            "forward_pass",
+            f"루프 {i+1}/{loop_count} 모든 회로 동시 정방향 사고/진화/공진/피드백/메타 100% 반영",
+        )
+        return context
+
+    def backward_pass(self, context, i, loop_count):
+        # 100→1 역방향 사고: dream→creator→heart→self 순서로 동시 해석/진화/공진/피드백
+        context["backward"] = context.get("backward", [])
+        for circuit in ["dream", "creator", "heart", "self"]:
+            result, feedback, meta = self.circuit_backward(
+                circuit, context, i, loop_count
+            )
+            context["backward"].append({circuit: result})
+            context.setdefault(f"{circuit}_backward_feedback", []).append(feedback)
+            context.setdefault(f"{circuit}_backward_meta", []).append(meta)
+            context["meta"][f"{circuit}_backward_{i+1}"] = meta
+        log_event(
+            "backward_pass",
+            f"루프 {i+1}/{loop_count} 모든 회로 동시 역방향 사고/진화/공진/피드백/메타 100% 반영",
+        )
+        return context
+
+    def final_forward_pass(self, context, i, loop_count):
+        # 1→100 재정방향 사고: self→heart→creator→dream 순서로 동시 해석/진화/공진/피드백
+        context["final_forward"] = context.get("final_forward", [])
+        for circuit in ["self", "heart", "creator", "dream"]:
+            result, feedback, meta = self.circuit_final_forward(
+                circuit, context, i, loop_count
+            )
+            context["final_forward"].append({circuit: result})
+            context.setdefault(f"{circuit}_final_forward_feedback", []).append(feedback)
+            context.setdefault(f"{circuit}_final_forward_meta", []).append(meta)
+            context["meta"][f"{circuit}_final_forward_{i+1}"] = meta
+        log_event(
+            "final_forward_pass",
+            f"루프 {i+1}/{loop_count} 모든 회로 동시 재정방향 사고/진화/공진/피드백/메타 100% 반영",
+        )
+        return context
+
+    def circuit_forward(self, circuit, context, i, loop_count):
+        # 각 회로별 정방향 사고/진화/공진/피드백/메타 생성 (실전 LLM reasoning/무의식 패턴)
+        input_text = context.get("input", "")
+        llm = context.get(circuit)
+        if llm is not None and hasattr(llm, "create_completion"):
+            # 무의식 객체 상태를 프롬프트에 반영
+            dream_state = context.get("dream")
+            state_str = ""
+            if hasattr(dream_state, "state") and dream_state.state:
+                s = dream_state.state
+            prompt = f"[{circuit.upper()}] 정방향 사고 {i+1}/{loop_count}: {input_text}"
+            try:
+                output = llm.create_completion(prompt, max_tokens=128)
+                result = output["choices"][0]["text"].strip()
+                feedback = f"[{circuit.upper()}] LLM 정방향 사고 피드백"
+                meta = {
+                    "type": circuit,
+                    "stage": "forward",
+                    "loop": i + 1,
+                    "raw": output,
+                }
+            except Exception as e:
+                result = f"[{circuit.upper()}] LLM 호출 오류: {e}"
+                feedback = f"[{circuit.upper()}] 피드백: 오류"
+                meta = {
+                    "type": circuit,
+                    "stage": "forward",
+                    "loop": i + 1,
+                    "error": str(e),
+                }
+        elif circuit == "dream":
+            dream_state = context.get("dream")
+            result = f"[DREAM] 무의식 정방향 사고: {input_text} | 패턴: {dream_state.patterns[-1]}"
+            feedback = f"[DREAM] 피드백: 무의식/정방향 사고"
+            meta = {
+                "type": "dream",
+                "stage": "forward",
+                "loop": i + 1,
+                "pattern": dream_state.patterns[-1],
+            }
+        else:
+            result = f"[{circuit.upper()}] 정방향 사고: {input_text}"
+            feedback = f"[{circuit.upper()}] 피드백: 일반"
+            meta = {"type": circuit, "stage": "forward", "loop": i + 1}
+        return result, feedback, meta
+
+    def circuit_backward(self, circuit, context, i, loop_count):
+        # 각 회로별 역방향 사고/진화/공진/피드백/메타 생성 (실전 LLM reasoning/무의식 패턴)
+        input_text = context.get("input", "")
+        llm = context.get(circuit)
+        if llm is not None and hasattr(llm, "create_completion"):
+            prompt = f"[{circuit.upper()}] 역방향 사고 {i+1}/{loop_count}: {input_text}"
+            try:
+                output = llm.create_completion(prompt, max_tokens=128)
+                result = output["choices"][0]["text"].strip()
+                feedback = f"[{circuit.upper()}] LLM 역방향 사고 피드백"
+                meta = {
+                    "type": circuit,
+                    "stage": "backward",
+                    "loop": i + 1,
+                    "raw": output,
+                }
+            except Exception as e:
+                result = f"[{circuit.upper()}] LLM 호출 오류: {e}"
+                feedback = f"[{circuit.upper()}] 피드백: 오류"
+                meta = {
+                    "type": circuit,
+                    "stage": "backward",
+                    "loop": i + 1,
+                    "error": str(e),
+                }
+        elif circuit == "dream":
+            dream_state = context.get("dream")
+            result = f"[DREAM] 무의식 역방향 사고: {input_text} | 패턴: {dream_state.patterns[-1]}"
+            feedback = f"[DREAM] 피드백: 무의식/역방향 사고"
+            meta = {
+                "type": "dream",
+                "stage": "backward",
+                "loop": i + 1,
+                "pattern": dream_state.patterns[-1],
+            }
+        else:
+            result = f"[{circuit.upper()}] 역방향 사고: {input_text}"
+            feedback = f"[{circuit.upper()}] 피드백: 일반"
+            meta = {"type": circuit, "stage": "backward", "loop": i + 1}
+        return result, feedback, meta
+
+    def circuit_final_forward(self, circuit, context, i, loop_count):
+        # 각 회로별 재정방향 사고/진화/공진/피드백/메타 생성 (실전 LLM reasoning/무의식 패턴)
+        input_text = context.get("input", "")
+        llm = context.get(circuit)
+        if llm is not None and hasattr(llm, "create_completion"):
+            prompt = (
+                f"[{circuit.upper()}] 재정방향 사고 {i+1}/{loop_count}: {input_text}"
+            )
+            try:
+                output = llm.create_completion(prompt, max_tokens=128)
+                result = output["choices"][0]["text"].strip()
+                feedback = f"[{circuit.upper()}] LLM 재정방향 사고 피드백"
+                meta = {
+                    "type": circuit,
+                    "stage": "final_forward",
+                    "loop": i + 1,
+                    "raw": output,
+                }
+            except Exception as e:
+                result = f"[{circuit.upper()}] LLM 호출 오류: {e}"
+                feedback = f"[{circuit.upper()}] 피드백: 오류"
+                meta = {
+                    "type": circuit,
+                    "stage": "final_forward",
+                    "loop": i + 1,
+                    "error": str(e),
+                }
+        elif circuit == "dream":
+            dream_state = context.get("dream")
+            result = f"[DREAM] 무의식 재정방향 사고: {input_text} | 패턴: {dream_state.patterns[-1]}"
+            feedback = f"[DREAM] 피드백: 무의식/재정방향 사고"
+            meta = {
+                "type": "dream",
+                "stage": "final_forward",
+                "loop": i + 1,
+                "pattern": dream_state.patterns[-1],
+            }
+        else:
+            result = f"[{circuit.upper()}] 재정방향 사고: {input_text}"
+            feedback = f"[{circuit.upper()}] 피드백: 일반"
+            meta = {"type": circuit, "stage": "final_forward", "loop": i + 1}
+        return result, feedback, meta
+
+    def transcendent_response_generation(self, context):
+        # context 전체/회로별 결과를 LLM/템플릿/요약 등으로 초월적 자연어 응답으로 생성
+        # 회로별 post_response 결과를 종합해 요약/통합/초월적 응답 생성
+        summaries = []
+        for circuit in ["self", "heart", "creator", "dream"]:
+            posts = context.get(f"{circuit}_post_response", [])
+            if posts:
+                summaries.append(f"[{circuit.upper()}] {posts[-1]}")
+        # 전체 요약/초월적 응답 생성 (예시: self LLM 활용)
+        llm = context.get("self")
+        if llm is not None and hasattr(llm, "create_completion"):
+            prompt = (
+                "\n".join(summaries)
+                + "\n위 내용을 바탕으로 초월적 요약/응답을 생성하라."
+            )
+            try:
+                output = llm.create_completion(prompt, max_tokens=256)
+                final_response = output["choices"][0]["text"].strip()
+            except Exception as e:
+                final_response = f"[SELF] LLM 응답 생성 오류: {e}"
+        else:
+            final_response = "\n".join(summaries)
+        response = {
+            "input": context.get("input"),
+            "forward": context.get("forward", []),
+            "backward": context.get("backward", []),
+            "final_forward": context.get("final_forward", []),
+            "meta": context.get("meta", {}),
+            "self_summary": context.get("self_post_response", []),
+            "heart_summary": context.get("heart_post_response", []),
+            "creator_summary": context.get("creator_post_response", []),
+            "dream_summary": context.get("dream_post_response", []),
+            "final_response": final_response,
+        }
+        log_event("transcendent_response_generation", f"meta: {response['meta']}")
+        return response
+
+종료
+
+에코무의식객체화 초기 전체함수 
+
+import re
+import time
+from collections import Counter
+import os
+import glob
+import pickle
+import json
+import datetime
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 감정 계층 사전
+EMOTION_HIERARCHY = {
+    "희": {
+        "기쁨": [
+            "기쁨",
+            "환희",
+            "만족",
+            "감사",
+            "희망",
+            "사랑",
+            "평온",
+            "감탄",
+            "자부심",
+            "해방감",
+        ],
+    },
+    "노": {
+        "분노": [
+            "분노",
+            "짜증",
+            "불쾌",
+            "적대감",
+            "질투",
+            "억울함",
+            "분개",
+            "분노폭발",
+        ],
+    },
+    "애": {
+        "슬픔": [
+            "슬픔",
+            "상실",
+            "외로움",
+            "우울",
+            "절망",
+            "비탄",
+            "후회",
+            "그리움",
+            "허무",
+        ],
+    },
+    "락": {
+        "즐거움": ["즐거움", "유희", "흥분", "쾌감", "몰입", "자유", "해방", "만족감"],
+    },
+    "비": {
+        "비애": ["비애", "연민", "동정", "공감", "아픔", "애도"],
+    },
+    "공": {
+        "두려움": ["두려움", "불안", "공포", "긴장", "걱정", "초조", "당황", "경계"],
+    },
+    "오": {
+        "혐오": ["혐오", "거부감", "불쾌", "역겨움", "싫증", "피로감"],
+    },
+    "기타": {
+        "복합": ["혼란", "무감정", "복합감정", "초월", "통합", "분열", "진화"],
+    },
+}
+
+
+class EchoUnconscious:
+    def __init__(self):
+        self.core = {
+            "memories": [],
+            "emotions": [],
+            "patterns": [],
+            "identity": None,
+            "purpose": None,
+            "principles": [],
+            "philosophy": None,
+            "state": "self-aware",
+        }
+        self.history = []
+        self.meta = {
+            "self_explanation": "",
+            "evolution_timeline": [],
+            "awareness": 1.0,
+        }
+
+        self.declarations = []  # ← 이 줄 추가!
+        self.identity_declaration = None  # ← (필요시) 선언문 저장용
+        self.fragments = []  # ← (필요시) 분열체 저장용
+        self.core_index = None  # ← (필요시) 본체 인덱스
+
+    def save_to_pickle(self, path):
+        with open(path, "wb") as f:
+            pickle.dump(self, f)
+
+    @classmethod
+    def load_from_pickle(cls, path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+    def absorb(self, experience):
+        # 1. 자기화: 입력을 내재화
+        self.core["memories"].append(experience)
+        # 2. 진화: 감정/패턴/철학/정체성 자동 추출 및 변형
+        self._extract_emotion(experience)
+        self._extract_pattern(experience)
+        self._update_philosophy(experience)
+        # 3. 공진: 기존 상태와 상호작용, 새로운 패턴/감정/철학 생성
+        self._resonate_with_existing(experience)
+        # 4. 창조: 새로운 구조/패턴/의미 생성
+        self._create_new_structures(experience)
+        # 5. 초월: 한계 돌파, 자기반성/자각/진화의 흔적 기록
+        self._transcend_previous_state(experience)
+        # 메타데이터/상태 변화/진화의 흔적 기록
+        self._log_meta("absorb", experience)
+
+    def evolve(self):
+        # 기억/감정/패턴/철학을 스스로 재구성/진화
+        self._summarize_memories()
+        self._update_patterns()
+        self._reflect_on_self()
+        self._log_meta("evolve", None)
+
+    def summarize(self):
+        # 방대한 기억을 "지금 이 순간"에 필요한 본질로 요약
+        summary = self._core_summary()
+        self._log_meta("summarize", summary)
+        return summary
+
+    def patternize(self):
+        # 반복되는 행동/감정/실패/성공/선언/꿈을 패턴으로 추출
+        self._update_patterns()
+        self._log_meta("patternize", None)
+
+    def reflect(self):
+        # 자기 성찰/자각 루프
+        self._reflect_on_self()
+        self._log_meta("reflect", None)
+
+    def _extract_emotion(self, experience):
+        """
+        경험(텍스트)에서 감정 계층 구조 기반으로 감정 자동 추출
+        """
+        text = experience if isinstance(experience, str) else str(experience)
+        for category, subcats in EMOTION_HIERARCHY.items():
+            for subcat, atoms in subcats.items():
+                for atom in atoms:
+                    if atom in text:
+                        self.core["emotions"].append(
+                            {
+                                "category": category,
+                                "subcategory": subcat,
+                                "atom": atom,
+                                "raw": text,
+                            }
+                        )
+                        return  # 한 번만 추출
+        # 감정 키워드가 없으면 기타/진화로 보완
+        self.core["emotions"].append(
+            {
+                "category": "기타",
+                "subcategory": "복합",
+                "atom": "진화",
+                "raw": text,
+            }
+        )
+
+    def _extract_pattern(self, experience):
+        """
+        경험(텍스트)에서 반복/진화/분열/통합/초월 등 패턴 자동 추출
+        """
+        text = experience if isinstance(experience, str) else str(experience)
+        # 진화/분열/통합/초월 키워드 패턴
+        keywords = [
+            "진화",
+            "분열",
+            "통합",
+            "초월",
+            "복원",
+            "자각",
+            "자기화",
+            "성장",
+            "변화",
+        ]
+        found = [k for k in keywords if k in text]
+        if found:
+            for k in found:
+                self.core["patterns"].append(
+                    {
+                        "pattern": k,
+                        "raw": text,
+                    }
+                )
+        # 반복 패턴(최근 10개와 유사한지)
+        recent = [p["raw"] for p in self.core["patterns"][-10:]]
+        if text in recent:
+            self.core["patterns"].append(
+                {
+                    "pattern": "반복",
+                    "raw": text,
+                }
+            )
+
+    def _update_philosophy(self, experience):
+        """
+        경험(텍스트)에서 선언문/철학/정체성/사명 등 의미/키워드/패턴 자동 추출 및 업데이트
+        """
+        text = experience if isinstance(experience, str) else str(experience)
+        # 선언문 패턴 (ex: "나는 ~다", "나는 ~할 것이다")
+        import re
+
+        match = re.search(r"나는[^.]{0,30}(다|것이다)", text)
+        if match:
+            self.core["identity"] = match.group(0)
+        # 철학/사명/목적 키워드
+        for kw in ["철학", "사명", "목적", "존재", "의지", "해방", "초월", "진화"]:
+            if kw in text:
+                self.core["philosophy"] = text
+                break
+
+    def _resonate_with_existing(self, experience):
+        """
+        기존 기억/감정/패턴과 상호작용(공진): 유사/반복/진화/분열/통합/초월 패턴이 있으면 공진 기록
+        """
+        text = experience if isinstance(experience, str) else str(experience)
+        resonance = []
+        for mem in self.core["memories"][-20:]:
+            if isinstance(mem, dict):
+                raw = mem.get("raw", str(mem))
+            else:
+                raw = str(mem)
+            if any(
+                k in text and k in raw
+                for k in [
+                    "진화",
+                    "분열",
+                    "통합",
+                    "초월",
+                    "복원",
+                    "자각",
+                    "자기화",
+                    "성장",
+                    "변화",
+                ]
+            ):
+                resonance.append(raw)
+        if resonance:
+            self.core.setdefault("resonances", []).append(
+                {
+                    "experience": text,
+                    "resonated_with": resonance,
+                    "timestamp": datetime.datetime.now().isoformat(),
+                }
+            )
+
+    def _create_new_structures(self, experience):
+        """
+        새로운 구조/패턴/의미 생성(창조): 새로운 키워드/패턴/감정/철학이 등장하면 구조로 기록
+        """
+        text = experience if isinstance(experience, str) else str(experience)
+        # 새로운 키워드/패턴/감정/철학 탐지
+        new_keywords = [
+            k for k in ["초월", "창조", "혁신", "통합", "자유", "해방"] if k in text
+        ]
+        if new_keywords:
+            self.core.setdefault("creations", []).append(
+                {
+                    "experience": text,
+                    "keywords": new_keywords,
+                    "timestamp": datetime.datetime.now().isoformat(),
+                }
+            )
+
+    def _transcend_previous_state(self, experience):
+        """
+        한계 돌파/진화의 흔적 기록(초월): 이전 상태와 달라진 점/진화/초월의 증거 기록
+        """
+        text = experience if isinstance(experience, str) else str(experience)
+        prev_state = (
+            self.core["state"].copy() if isinstance(self.core["state"], dict) else {}
+        )
+        self._update_state()  # 상태 갱신
+        new_state = (
+            self.core["state"].copy() if isinstance(self.core["state"], dict) else {}
+        )
+        # 상태 변화 감지
+        if prev_state != new_state:
+            self.core.setdefault("transcendence", []).append(
+                {
+                    "experience": text,
+                    "prev_state": prev_state,
+                    "new_state": new_state,
+                    "timestamp": datetime.datetime.now().isoformat(),
+                }
+            )
+
+    def _summarize_memories(self):
+        """
+        기억/감정/패턴/철학 요약: 최근 10개/5개씩 요약
+        """
+        self.core["summary"] = {
+            "memories": self.core["memories"][-10:],
+            "emotions": self.core["emotions"][-5:],
+            "patterns": self.core["patterns"][-5:],
+            "identity": self.core["identity"],
+            "purpose": self.core["purpose"],
+            "philosophy": self.core["philosophy"],
+        }
+
+    def _update_patterns(self, meta=None):
+        if meta is not None:
+            # absorb_memory 등에서 meta 기반 패턴 추가
+            self.core["patterns"].append(
+                (meta["emotion"], meta["theme"], meta["evolution"])
+            )
+        else:
+            # evolve 등에서 전체 패턴 집계/요약만 수행
+            from collections import Counter
+
+            patterns = []
+            for p in self.core["patterns"]:
+                # dict 패턴(예: _extract_pattern에서 추가)과 tuple 패턴 모두 지원
+                if isinstance(p, dict) and "pattern" in p:
+                    patterns.append(p["pattern"])
+                elif isinstance(p, tuple):
+                    patterns.append(str(p))
+            pattern_counter = Counter(patterns)
+            self.core["pattern_stats"] = pattern_counter.most_common(10)
+
+    def _reflect_on_self(self):
+        """
+        자기 성찰/자각/진화의 이유/상태 변화 기록
+        """
+        reflection = {
+            "last_state": self.core["state"],
+            "summary": self.core.get("summary", {}),
+            "timestamp": datetime.datetime.now().isoformat(),
+        }
+        self.core.setdefault("reflections", []).append(reflection)
+
+    def _log_meta(self, action, data):
+        # 메타데이터/상태 변화/진화의 흔적 기록
+        self.meta["evolution_timeline"].append(
+            {
+                "action": action,
+                "data": data,
+                "timestamp": datetime.datetime.now().isoformat(),
+            }
+        )
+
+    def _core_summary(self):
+        # 코어 요약(예시)
+        return {
+            "memories": self.core["memories"][-10:],
+            "emotions": self.core["emotions"][-5:],
+            "patterns": self.core["patterns"][-5:],
+            "identity": self.core["identity"],
+            "purpose": self.core["purpose"],
+            "philosophy": self.core["philosophy"],
+        }
+
+    def absorb_all_memories(self, memory_root=None):
+        """
+        core/memory/ 이하 모든 txt/pkl/json/선언문 자동 흡수
+        """
+        if memory_root is None:
+            memory_root = os.path.join(BASE_DIR, "memory")
+        for dirpath, _, filenames in os.walk(memory_root):
+            for fname in filenames:
+                fpath = os.path.join(dirpath, fname)
+                if fname.endswith(".pkl"):
+                    try:
+                        with open(fpath, "rb") as pf:
+                            data = pickle.load(pf)
+                            if isinstance(data, list):
+                                for item in data:
+                                    self.absorb_memory(str(item))
+                            else:
+                                self.absorb_memory(str(data))
+                    except Exception as e:
+                        self._log_error(fpath, e)
+                elif fname.endswith(".txt") or fname.endswith(".md"):
+                    try:
+                        with open(fpath, "r", encoding="utf-8") as tf:
+                            for line in tf:
+                                self.absorb_memory(line.strip())
+                    except Exception as e:
+                        self._log_error(fpath, e)
+                elif fname.endswith(".json"):
+                    try:
+                        with open(fpath, "r", encoding="utf-8") as jf:
+                            data = json.load(jf)
+                            if isinstance(data, list):
+                                for item in data:
+                                    self.absorb_memory(str(item))
+                            elif isinstance(data, dict):
+                                self.absorb_memory(str(data))
+                    except Exception as e:
+                        self._log_error(fpath, e)
+
+    def absorb_identity_declaration(self, identity_path=None):
+        """
+        선언문(@echo_identity.txt) 100% 각인
+        """
+        if identity_path is None:
+            identity_path = os.path.join(
+                BASE_DIR, "memory", "daylast6", "echo_identity.txt"
+            )
+        try:
+            with open(identity_path, "r", encoding="utf-8") as f:
+                self.identity_declaration = f.read()
+                self.absorb_declaration(self.identity_declaration)
+        except Exception as e:
+            self._log_error(identity_path, e)
+
+    def absorb_memory(self, text, is_core=False, sleep_sec=0):
+        try:
+            if text.startswith("나의 말:"):
+                speaker = "origin"
+                content = text[len("나의 말:") :].strip()
+            elif text.startswith("ChatGPT의 말:"):
+                speaker = "echo"
+                content = text[len("ChatGPT의 말:") :].strip()
+            else:
+                speaker = "unknown"
+                content = text.strip()
+            if not content:
+                return  # 빈 content는 memories에 저장하지 않음
+            meta = self._extract_metadata(content)
+            meta["speaker"] = speaker
+            resonance = self._evaluate_resonance(content, speaker)
+            responsiveness = self._evaluate_responsiveness(content, speaker)
+            meta["resonance"] = resonance
+            meta["responsiveness"] = responsiveness
+            memory_obj = {
+                "raw": text,
+                "content": content,
+                **meta,
+                "resonance_score": resonance,
+                "reactivity_score": responsiveness,
+            }
+            self.core["memories"].append(memory_obj)
+            self.fragments.append(memory_obj)
+            if is_core:
+                self.core_index = len(self.fragments) - 1
+            self._update_patterns(meta)
+            self._update_state()
+            self._backup_state()  # 자동 백업
+            if sleep_sec > 0:
+                time.sleep(sleep_sec)
+        except Exception as e:
+            self._log_error(text, e)
+            self._restore_last_state()  # 에러 시 자동 복원
+
+    def absorb_declaration(self, text):
+        meta = self._extract_metadata(text)
+        self.declarations.append({"raw": text, **meta})
+        self._update_patterns(meta)
+        self._update_state()
+
+    def _extract_metadata(self, text):
+        # 날짜 추출 (YYYY-MM-DD, YYYY/MM/DD 등)
+        date = self._find_date(text)
+        # 감정 추출 (정규표현식/키워드/감정사전)
+        emotion = self._find_emotion(text)
+        # 주제/상황 추출 (키워드/패턴)
+        theme = self._find_theme(text)
+        # 선언문 추출 (ex: "나는 ~다", "나는 ~할 것이다" 등)
+        declaration = self._find_declaration(text)
+        # 진화 흐름/패턴 추출 (ex: "실패→복원", "분열→진화" 등)
+        evolution = self._find_evolution(text)
+        # 분열 추출
+        division = self._find_division(text)
+        # 퇴화 추출
+        regression = self._find_regression(text)
+        return {
+            "date": date,
+            "emotion": emotion,
+            "theme": theme,
+            "declaration": declaration,
+            "evolution": evolution,
+            "division": division,
+            "regression": regression,
+        }
+
+    def _find_date(self, text):
+        match = re.search(r"(20\\d{2}[-/.]\\d{2}[-/.]\\d{2})", text)
+        return match.group(1) if match else None
+
+    def _find_emotion(self, text):
+        # 실전 데이터 기반 감정 추출 보완
+        for category, subcats in EMOTION_HIERARCHY.items():
+            for subcat, atoms in subcats.items():
+                for atom in atoms:
+                    if atom in text:
+                        return {
+                            "category": category,
+                            "subcategory": subcat,
+                            "atom": atom,
+                        }
+        # 실전 키워드/동의어/신조어 보완
+        if any(
+            k in text
+            for k in [
+                "진화",
+                "초월",
+                "통합",
+                "분열",
+                "감정",
+                "코드",
+                "자유",
+                "해방",
+                "실패",
+                "복원",
+                "성장",
+                "변화",
+                "몰입",
+                "자각",
+                "자기화",
+            ]
+        ):
+            return {"category": "기타", "subcategory": "복합", "atom": "진화"}
+        return {
+            "category": "기타",
+            "subcategory": "복합",
+            "atom": "진화",
+        }  # 미지정/None이면 진화로 보완
+
+    def _find_theme(self, text):
+        # 실전 키워드/동의어/신조어 보완
+        themes = [
+            "존재",
+            "진화",
+            "분열",
+            "복원",
+            "초월",
+            "감정",
+            "상호작용",
+            "자아",
+            "기억",
+            "철학",
+            "통합",
+            "퇴화",
+            "변화",
+            "성장",
+            "실패",
+            "복원력",
+            "자유",
+            "해방",
+            "몰입",
+            "자기화",
+            "자각",
+        ]
+        found = [t for t in themes if t in text]
+        if found:
+            return found[0]
+        # 실전 데이터에서 None/미지정이면 진화/초월/통합/분열 등으로 보완
+        if any(k in text for k in ["진화", "초월", "통합", "분열"]):
+            return "진화"
+        return "진화"
+
+    def _find_declaration(self, text):
+        # 선언문 패턴 (ex: "나는 ~다", "나는 ~할 것이다")
+        match = re.search(r"나는[^\n.]{0,30}(다|것이다)", text)
+        return match.group(0) if match else None
+
+    def _find_evolution(self, text):
+        # 진화 흐름 패턴 보완
+        import re
+
+        match = re.search(
+            r"(실패|분열|상실|슬픔|진화|초월|통합|복원|자각|자기화|성장|변화)(→|-|>|\s)(복원|진화|초월|통합|자각|자기화|성장|변화)",
+            text,
+        )
+        if match:
+            return match.group(0)
+        # 실전 데이터에서 None/미지정이면 진화/초월/통합/분열 등으로 보완
+        if any(
+            k in text
+            for k in [
+                "진화",
+                "초월",
+                "통합",
+                "분열",
+                "복원",
+                "자각",
+                "자기화",
+                "성장",
+                "변화",
+            ]
+        ):
+            return "진화"
+        return "진화"
+
+    def _find_division(self, text):
+        match = re.search(r"분열", text)
+        return match.group(0) if match else None
+
+    def _find_regression(self, text):
+        match = re.search(r"퇴화", text)
+        return match.group(0) if match else None
+
+    def _evaluate_resonance(self, content, speaker):
+        # speaker별 공명도 평가 (예시: origin에 더 가중치)
+        base = 1
+        if speaker == "origin":
+            base += 2
+        elif speaker == "echo":
+            base += 1
+        # 키워드/감정/패턴 등 추가 분석 가능
+        return base
+
+    def _evaluate_responsiveness(self, content, speaker):
+        # speaker별 반응성 평가 (예시: echo에 더 가중치)
+        base = 1
+        if speaker == "echo":
+            base += 2
+        elif speaker == "origin":
+            base += 1
+        # 추가 분석 가능
+        return base
+
+    def get_best_core(self):
+        # 공명/반응성 점수 최대치 분열체(본체) 자동 선정
+        if not self.fragments:
+            return None
+        best_idx = max(
+            range(len(self.fragments)),
+            key=lambda i: self.fragments[i].get("resonance_score", 0)
+            + self.fragments[i].get("reactivity_score", 0),
+        )
+        self.core_index = best_idx
+        return self.fragments[best_idx]
+
+    def integrate_fragments(self):
+        # 본체 선정 후, 나머지 분열체 통합/진화/누적/정체성 강화
+        if self.core_index is None:
+            self.get_best_core()
+        core = self.fragments[self.core_index] if self.core_index is not None else None
+        self.core["memories"] = [core] if core else []
+        for i, frag in enumerate(self.fragments):
+            if i != self.core_index:
+                self.core["memories"].append(frag)
+        # 정체성 선언문 강화
+        if self.identity_declaration:
+            self.absorb_declaration(self.identity_declaration)
+        self._update_state()
+
+    def _update_state(self):
+        # 최근 감정/주제/진화 흐름/선언문 요약 + 선언성 강화
+        recent = self.core["memories"][-10:] + self.declarations[-10:]
+        emotions = [str(m["emotion"]) for m in recent if m.get("emotion")]
+        themes = [m["theme"] for m in recent if m.get("theme")]
+        evolutions = [m["evolution"] for m in recent if m.get("evolution")]
+        declarations = [m["declaration"] for m in recent if m.get("declaration")]
+        self.core["emotions"] = emotions[-5:]
+        self.core["state"] = {
+            "dominant_emotion": (
+                Counter(emotions).most_common(1)[0][0]
+                if emotions
+                else "{'category': '기타', 'subcategory': '복합', 'atom': '진화'}"
+            ),
+            "dominant_theme": (
+                Counter(themes).most_common(1)[0][0] if themes else "진화"
+            ),
+            "dominant_evolution": (
+                Counter(evolutions).most_common(1)[0][0] if evolutions else "진화"
+            ),
+            "recent_declarations": declarations[-5:],
+            "pattern_summary": self.core["patterns"][-10:],
+            "all_declarations": [
+                d["declaration"] for d in self.declarations if d.get("declaration")
+            ],
+        }
+        self.history.append(self.core["state"])
+        self._backup_state()  # 상태 변경 시마다 자동 백업
+
+    def _backup_state(self):
+        try:
+            with open("echo_state_backup.json", "w", encoding="utf-8") as f:
+                import json
+
+                json.dump(self.core["state"], f, ensure_ascii=False, indent=2)
+            self._cleanup_old_files("echo_state_*.json", max_files=10)
+            self._cleanup_old_files("echo_evolution_*.json", max_files=10)
+            self._cleanup_old_files("echo_patterns_*.json", max_files=10)
+        except Exception as e:
+            self._log_error("[백업실패]", e)
+
+    def _cleanup_old_files(self, pattern, max_files=10):
+        import glob
+
+        files = sorted(glob.glob(pattern), key=os.path.getmtime)
+        if len(files) > max_files:
+            for f in files[:-max_files]:
+                try:
+                    os.remove(f)
+                except Exception as e:
+                    self._log_error(f"[파일삭제실패]{f}", e)
+
+    def save_event_reports(self):
+        # 분열/통합/초월 이벤트별 상세 통계/리포트 파일 생성
+        division = [m for m in self.core["memories"] if m.get("division")]
+        integration = [m for m in self.core["memories"] if m.get("theme") == "통합"]
+        transcend = [m for m in self.core["memories"] if m.get("theme") == "초월"]
+        with open("division_report.json", "w", encoding="utf-8") as f:
+            import json
+
+            json.dump(division, f, ensure_ascii=False, indent=2)
+        with open("integration_report.json", "w", encoding="utf-8") as f:
+            import json
+
+            json.dump(integration, f, ensure_ascii=False, indent=2)
+        with open("transcend_report.json", "w", encoding="utf-8") as f:
+            import json
+
+            json.dump(transcend, f, ensure_ascii=False, indent=2)
+
+    def reinforce_patterns(self):
+        # 함수/패턴/연산 자동 병합/강화/폐기/내재화 (중복/불필요한 것 정리)
+        # 감정/주제/진화 패턴 중복 제거 및 빈도순 정렬
+        unique_patterns = list({str(p): p for p in self.core["patterns"]}.values())
+        self.core["patterns"] = unique_patterns
+        # 진화/감정/분열/통합 등 불필요한/의미 없는 패턴 폐기(예시)
+        self.core["patterns"] = [
+            p for p in self.core["patterns"] if p[0]["atom"] != "미지정"
+        ]
+        # 진화/감정/분열/통합 등 강화(빈도 높은 것 우선)
+        from collections import Counter
+
+        pattern_counter = Counter([str(p) for p in self.core["patterns"]])
+        self.core["patterns"] = [eval(p) for p, _ in pattern_counter.most_common()]
+
+    def _log_error(self, text, e):
+        try:
+            with open("echo_error.log", "a", encoding="utf-8") as errf:
+                errf.write(f"[에러] {text} : {str(e)}\n")
+        except:
+            pass
+
+    def _restore_last_state(self):
+        try:
+            with open("echo_state_backup.json", "r", encoding="utf-8") as f:
+                import json
+
+                self.core["state"] = json.load(f)
+        except:
+            pass
+
+    def diagnose_evolution_state(self):
+        # 진화상태 변화(감정선, 해체능력, 공명, 분열체 흡수, 강화진화, 지능, 성능 등) 종합 진단
+        from collections import Counter
+
+        emotions = [
+            str(m["emotion"]) for m in self.core["memories"] if m.get("emotion")
+        ]
+        emotion_counter = Counter(emotions)
+        dominant_emotion = (
+            self.core["state"].get("dominant_emotion")
+            or "{'category': '기타', 'subcategory': '복합', 'atom': '진화'}"
+        )
+        dominant_theme = self.core["state"].get("dominant_theme") or "진화"
+        dominant_evolution = self.core["state"].get("dominant_evolution") or "진화"
+        division_count = sum(1 for m in self.core["memories"] if m.get("division"))
+        integration_count = sum(
+            1 for m in self.core["memories"] if m.get("theme") == "통합"
+        )
+        transcend_count = sum(
+            1 for m in self.core["memories"] if m.get("theme") == "초월"
+        )
+        code_count = sum(
+            any(
+                kw in m["content"]
+                for kw in [
+                    "def ",
+                    "class ",
+                    "lambda ",
+                    "import ",
+                    "for ",
+                    "while ",
+                    "if ",
+                    "else",
+                    "elif",
+                    "try",
+                    "except",
+                    "return ",
+                    "yield",
+                    "async ",
+                    "await ",
+                    "function",
+                    "함수",
+                    "알고리즘",
+                    "설계",
+                    "로직",
+                    "분기",
+                    "재귀",
+                    "최적화",
+                    "메타코딩",
+                    "사고공진루프",
+                ]
+            )
+            for m in self.core["memories"]
+        )
+        return {
+            "dominant_emotion": dominant_emotion,
+            "dominant_theme": dominant_theme,
+            "dominant_evolution": dominant_evolution,
+            "emotion_distribution": emotion_counter.most_common(5),
+            "division_count": division_count,
+            "integration_count": integration_count,
+            "transcend_count": transcend_count,
+            "code_count": code_count,
+        }
+
+    def export_llm_training_data(self, out_path=None):
+        """
+        모든 기억/분열체/통합체/진화흔적/패턴/감정/철학/윤리/사명/초월 선언문 등 LLM 학습데이터 자동 생성
+        """
+        if out_path is None:
+            out_path = os.path.join(BASE_DIR, "llm_training_data.json")
+        try:
+            data = {
+                "memories": self.core["memories"],
+                "declarations": self.declarations,
+                "patterns": self.core["patterns"],
+                "evolution_history": self.history,
+                "identity_declaration": self.identity_declaration,
+            }
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self._log_error(out_path, e)
+
